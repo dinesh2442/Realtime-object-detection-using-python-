@@ -3,7 +3,7 @@ Real-time object detection is a powerful application of computer vision that inv
 
 # Packages .install  
 
--Python version 3.12.4
+*Python version 3.12.4
 -pip install opencv-python (4.10.0.84)
 -pip install numpy (2.1.2)
 -pip install pillow (10.4.0)

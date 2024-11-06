@@ -1,131 +1,228 @@
-import threading
-import tkinter as tk
-from tkinter import *
-from PIL import Image, ImageTk
 import cv2
 import numpy as np
-from threading import Thread
+from typing import List, Tuple
+import tkinter as tk
+from tkinter import PhotoImage
+import signal
+import sys
+import pygame
+import time
 
-class ObjectDetection:
-    def __init__(self, num):
-        self.capture = cv2.VideoCapture(0)  # opens laptop's video cam
-
-        self.yolo = cv2.dnn.readNet("./yolov3.cfg", "./yolov3.weights")
-
-        self.classes = []  # 80 classes
-        with open("./coco.names", "r") as f:
-            self.classes = f.read().splitlines()
-
-        self.thread = Thread(target=self.update, args=())
-        self.thread.daemon = True
-        self.thread.start()
-
-    def update(self):
-        while True:
-            if self.capture.isOpened():
-                (self.status, self.frame) = self.capture.read()
-
-    def show_frame(self):
-        try:
-            if self.status:
-                img = cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB)
-                blob = cv2.dnn.blobFromImage(self.frame, 1 / 255.0, (416, 416), (0, 0, 0), swapRB=True, crop=False)
-                self.yolo.setInput(blob)
-
-                output_layer_names = self.yolo.getUnconnectedOutLayersNames()
-                layer_output = self.yolo.forward(output_layer_names)
-
-                boxes = []
-                confidences = []
-                class_ids = []
-                h, w = img.shape[:2]
-                for output in layer_output:
-                    for detection in output:
-                        scores = detection[5:]
-                        classID = np.argmax(scores)
-                        confidence = scores[classID]
-
-                        if confidence > 0.4:
-                            box = detection[:4] * np.array([w, h, w, h])
-                            (centerX, centerY, width, height) = box.astype("int")
-                            x = int(centerX - (width / 2))
-                            y = int(centerY - (height / 2))
-                            box = [x, y, int(width), int(height)]
-                            boxes.append(box)
-                            confidences.append(float(confidence))
-                            class_ids.append(classID)
-                indexes = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
-                font = cv2.FONT_HERSHEY_PLAIN
-                colors = np.random.uniform(0, 255, size=(len(boxes), 3))
-                if len(boxes) != 0:
-                    for i in indexes.flatten():
-                        x, y, w, h = boxes[i]
-                        label = str(self.classes[class_ids[i]])
-                        conf = str(round(confidences[i], 2))
-                        color = colors[i]
-                        cv2.rectangle(img, (x, y), (x + w, y + h), color, 10)
-                        cv2.putText(img, label + " " + conf, (x, y + 20), font, 2, (255, 255, 255), 2)
-
-                    img1 = Image.fromarray(img)
-                    imgtk = ImageTk.PhotoImage(image=img1.resize((800, 800)))  # increased size
-                    lmain.imgtk = imgtk
-                    lmain.configure(image=imgtk)
-                    lmain.after(0, self.show_frame())  # this method is running infinitely
-                else:
-                    img = cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB)
-                    img1 = Image.fromarray(img)
-                    imgtk = ImageTk.PhotoImage(image=img1.resize((800, 800)))  # increased size
-                    lmain.imgtk = imgtk
-                    lmain.configure(image=imgtk)
-                    lmain.after(2, self.show_frame())
-
-        except tk.TclError:
-            print(" ")
+# Initialize Pygame for sound
+pygame.init()
+sound = pygame.mixer.Sound("alarm1.mp3")  # Ensure this sound file is in the same directory
 
 
-def cam(number):
-    rtsp_stream_link = number
-    video_stream_widget = ObjectDetection(number)
-    while True:
-        try:
-            video_stream_widget.show_frame()
-        except AttributeError:
-            pass
+class ObjectDetector:
+    """
+    A class for real-time object detection using YOLO, with distance measurement and sound/image capture capability.
+    """
+
+    def __init__(self, weights_path: str, config_path: str, classes_path: str, focal_length: float,
+                 known_object_height: float, known_object_width: float, use_gpu: bool = True):
+        """
+        Initialize the ObjectDetector with model paths and distance calculation parameters.
 
 
-def getwebcam():
-    global newWindow, lmain
-    newWindow = tk.Toplevel(root)
-    newWindow.title("Live Detection")
+        """
+        self.net = cv2.dnn.readNet(weights_path, config_path)
+        if use_gpu and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+            print("[INFO] GPU is available. Using CUDA backend.")
+            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+        else:
+            print("[INFO] GPU not found or not supported. Using CPU backend.")
+            self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_DEFAULT)
+            self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
 
-    newWindow.geometry("800x800")  # increased size
-    lmain = tk.Label(newWindow, text='Starting....................')
-    lmain.place(x=0, y=0)
-    t1 = threading.Thread(target=cam, args=(0,))
-    t1.start()
+        with open(classes_path, 'r') as f:
+            self.classes = [line.strip() for line in f.readlines()]
+        self.colors = np.random.uniform(0, 255, size=(len(self.classes), 3))
+        self.focal_length = focal_length
+        self.known_object_height = known_object_height
+        self.known_object_width = known_object_width
+
+    def detect_objects(self, frame: np.ndarray) -> List[Tuple[str, float, Tuple[int, int, int, int], float]]:
+        """
+        Detect objects in a single frame and calculate their distances.
+
+        :param frame: Input frame as a numpy array
+        :return: List of tuples containing (class_name, confidence, bounding_box, distance)
+        """
+        height, width = frame.shape[:2]
+        blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (416, 416), swapRB=True, crop=False)
+        self.net.setInput(blob)
+        layer_names = self.net.getLayerNames()
+        output_layers = [layer_names[i - 1] for i in self.net.getUnconnectedOutLayers()]
+        outputs = self.net.forward(output_layers)
+
+        class_ids = []
+        confidences = []
+        boxes = []
+
+        for output in outputs:
+            for detection in output:
+                scores = detection[5:]
+                if np.any(scores):
+                    class_id = np.argmax(scores)
+                    confidence = scores[class_id]
+                    if confidence > 0.5:
+                        center_x, center_y = int(detection[0] * width), int(detection[1] * height)
+                        w, h = int(detection[2] * width), int(detection[3] * height)
+                        x, y = int(center_x - w / 2), int(center_y - h / 2)
+                        boxes.append([x, y, w, h])
+                        confidences.append(float(confidence))
+                        class_ids.append(class_id)
+
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.5, 0.4)
+        results = []
+        for i in indices:
+            box = boxes[i]
+            class_name = self.classes[class_ids[i]]
+            confidence = confidences[i]
+            distance = self.calculate_distance(box[3])  # Using the height of the bounding box
+            results.append((class_name, confidence, tuple(box), distance))
+        return results
+
+    def calculate_distance(self, perceived_height: int) -> float:
+        """
+        Calculate the distance to an object based on its perceived height in the image.
+
+        :param perceived_height: The height of the bounding box in pixels
+        :return: Estimated distance to the object
+        """
+        if perceived_height == 0:
+            return float('inf')  # Avoid division by zero
+        return (self.known_object_height * self.focal_length) / perceived_height
+
+    def draw_detections(self, frame: np.ndarray,
+                        detections: List[Tuple[str, float, Tuple[int, int, int, int], float]]) -> np.ndarray:
+        """
+        Draw bounding boxes, labels, and distances on the frame.
+
+        :param frame: Input frame
+        :param detections: List of detections from detect_objects method
+        :return: Frame with drawn detections
+        """
+        for class_name, confidence, (x, y, w, h), distance in detections:
+            color = self.colors[self.classes.index(class_name)]
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+            label = f"{class_name}: {confidence:.2f}, Dist: {distance:.2f} cm"
+            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        return frame
 
 
-if __name__ == '__main__':
+class ObjectDetectionApp:
+    """
+    A class to manage the object detection application.
+    """
+
+    def __init__(self, weights_path: str, config_path: str, classes_path: str, focal_length: float,
+                 known_object_height: float, known_object_width: float, use_gpu: bool = True):
+        """
+        Initialize the ObjectDetectionApp.
+
+        :param weights_path: Path to the YOLO weights file
+        :param config_path: Path to the YOLO configuration file
+        :param classes_path: Path to the file containing class names
+        :param focal_length: The calibrated focal length of the camera
+        :param known_object_height: The known height of the object in real-world units (e.g., centimeters)
+        :param known_object_width: The known width of the object in real-world units (e.g., centimeters)
+        :param use_gpu: Whether to use GPU acceleration
+        """
+        self.detector = ObjectDetector(weights_path, config_path, classes_path, focal_length, known_object_height,
+                                       known_object_width, use_gpu)
+        self.cap = cv2.VideoCapture(0)
+        self.is_running = False
+
+    def start_detection(self):
+        """
+        Start the object detection application.
+        """
+        self.is_running = True
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+
+        while self.is_running:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+
+            detections = self.detector.detect_objects(frame)
+            person_detected = any(d[0] == "person" for d in detections)
+
+            if person_detected:
+                sound.play()  # Play sound if a person is detected
+
+                # Capture the frame as an image when a person is detected
+                timestamp = int(time.time())
+                cv2.imwrite(f"person_detection_{timestamp}.jpg", frame)
+                print(f"Image saved as person_detection_{timestamp}.jpg")
+
+            frame_with_detections = self.detector.draw_detections(frame, detections)
+            cv2.imshow("Real-time Object Detection", frame_with_detections)
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        self.stop()
+
+    def stop(self):
+        """
+        Stop the object detection application and release resources.
+        """
+        self.is_running = False
+        if self.cap.isOpened():
+            self.cap.release()
+        cv2.destroyAllWindows()
+        print("Application stopped. Resources released.")
+        sys.exit(0)
+
+    def signal_handler(self, sig, frame):
+        """
+        Handle interruption signals.
+        """
+        print("\nReceived interruption signal. Stopping the application...")
+        self.stop()
+
+
+def display_gui(app):
+    """
+    Display a Tkinter GUI with a 'Continue' button that starts object detection when clicked.
+    """
     root = tk.Tk()
-    root.geometry("750x394")
-    root.title("Object Detection")
-    root.configure(bg="black")
+    root.title("Object Detection App")
 
-    width = 750
-    height = 394
-    screen_width = root.winfo_screenwidth()
-    screen_height = root.winfo_screenheight()
-    x = (screen_width / 2) - (width / 2)
-    y = (screen_height / 2) - (height / 2)
-    root.geometry("%dx%d+%d+%d" % (width, height, x, y))
+    # Load a sample image for the initial screen
+    initial_img = PhotoImage(file="sample_image.png")  # Ensure this image file is in the same directory
 
-    # create a label widget for the background image
-    bg_image = tk.PhotoImage(file="./tkBackground.png")
-    bg_label = tk.Label(root, image=bg_image)
-    bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    canvas = tk.Canvas(root, width=initial_img.width(), height=initial_img.height())
+    canvas.pack()
 
-    # create the button for live detection
-    button3 = tk.Button(root, text="Live Detection", font=("Helvetica", 16), command=getwebcam, bd="5")
-    button3.place(x=300, y=290)
+    canvas.create_image(0, 0, anchor=tk.NW, image=initial_img)
+
+    # Add "Continue" button to start detection
+    continue_button = tk.Button(root, text="Get Started", command=lambda: (root.destroy(), app.start_detection()))
+    continue_button.pack(side=tk.BOTTOM, pady=10)
 
     root.mainloop()
+
+
+def main():
+    # Paths to the pre-trained model and configuration files
+    weights_path = "yolov3.weights"
+    config_path = "yolov3.cfg"
+    classes_path = "coco.names"
+
+    # Distance measurement parameters
+    focal_length = 615  # Example value, calculate this based on your calibration process
+    known_object_height = 8.37  # Example object height in centimeters
+    known_object_width = 15.92  # Example object width in centimeters
+
+    app = ObjectDetectionApp(weights_path, config_path, classes_path, focal_length, known_object_height,
+                             known_object_width, use_gpu=True)
+    display_gui(app)
+
+
+if __name__ == "__main__":
+    main()
